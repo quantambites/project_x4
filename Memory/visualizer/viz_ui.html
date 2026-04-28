@@ -889,10 +889,29 @@ function drawGraph() {
 // ─────────────────────────────────────────────────────────────────────────────
 async function selectEntity(ent) {
   STATE.selected_entity = ent;
+  // Load info_nodes if not cached
   if (ent && !STATE.info_nodes_cache[ent.node_id]) {
     try {
       const r = await fetch(`${API}/api/info_nodes?entity_id=${ent.node_id}`);
       if (r.ok) STATE.info_nodes_cache[ent.node_id] = await r.json();
+    } catch(e) {}
+  }
+  // Load full entity detail (includes runtime_embedding, audio_ptr) if not yet loaded
+  if (ent && ent.runtime_embedding === undefined) {
+    try {
+      const r = await fetch(`${API}/api/entities`);
+      if (r.ok) {
+        const all = await r.json();
+        const full = all.find(x => x.node_id === ent.node_id);
+        if (full) {
+          // Merge extra fields into the selected entity
+          Object.assign(ent, full);
+          STATE.selected_entity = ent;
+          // Also update in main entities array
+          const idx = STATE.entities.findIndex(x => x.node_id === ent.node_id);
+          if (idx >= 0) STATE.entities[idx] = ent;
+        }
+      }
     } catch(e) {}
   }
   drawMap();
@@ -980,74 +999,170 @@ function renderDetailTab() {
   const entEdges = STATE.edges.filter(ed=>ed.node_id_1===e.node_id||ed.node_id_2===e.node_id);
   const infos = STATE.info_nodes_cache[e.node_id] || [];
 
-  let edgesHtml = entEdges.length ? entEdges.map(ed => {
+  // ── Header ────────────────────────────────────────────────────────────────
+  const headerHtml = `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <div style="width:44px;height:44px;border-radius:50%;border:2px solid ${col};
+                  background:${col}18;display:flex;align-items:center;justify-content:center;
+                  color:${col};font-size:20px;font-weight:bold;flex-shrink:0">
+        ${(e.entity_type||'?')[0].toUpperCase()}</div>
+      <div style="flex:1;min-width:0">
+        <div style="color:${col};font-size:13px;font-weight:bold;
+                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${e.name}</div>
+        <div style="color:var(--textdim);font-size:8px;margin-top:2px">
+          ${e.entity_type||'?'} &nbsp;·&nbsp; floor ${e.floor_level||0}
+          &nbsp;·&nbsp; weight ${(e.weight||1).toFixed(2)}
+          ${e.location_ts?`&nbsp;·&nbsp; seen ${new Date(e.location_ts).toLocaleTimeString()}`:''}
+        </div>
+      </div>
+    </div>`;
+
+  // ── Summary ───────────────────────────────────────────────────────────────
+  const summaryHtml = e.summary ? `
+    <div class="detail-section">
+      <div class="detail-label">SUMMARY</div>
+      <div class="detail-value">${e.summary}</div>
+    </div>` : '';
+
+  // ── Full position block ───────────────────────────────────────────────────
+  const posHtml = `
+    <div class="detail-section">
+      <div class="detail-label">POSITION &amp; ORIENTATION</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-bottom:4px">
+        ${[['X',e.x,'m E'],['Y',e.y,'m N'],['Z',e.z,'m Up']].map(([l,v,u])=>`
+          <div style="background:var(--panel2);border:1px solid var(--border);border-radius:3px;padding:4px 6px">
+            <div style="font-size:7px;color:var(--textdim)">${l}</div>
+            <div style="font-size:11px;color:var(--acc);font-weight:bold">${(v||0).toFixed(2)}</div>
+            <div style="font-size:7px;color:var(--textdim)">${u}</div>
+          </div>`).join('')}
+      </div>
+      ${e.facing_deg!=null?`<div style="font-size:9px;color:var(--text);margin-bottom:2px">
+        Heading: <span style="color:var(--acc)">${e.facing_deg.toFixed(1)}°</span>
+        &nbsp; Pitch: <span style="color:var(--acc)">${(e.pitch_deg||0).toFixed(1)}°</span>
+      </div>`:''}
+      ${e.bbox_dx?`<div style="font-size:9px;color:var(--textdim)">
+        BBox: ${(e.bbox_dx*2).toFixed(2)}×${(e.bbox_dy*2).toFixed(2)}×${(e.bbox_dz*2).toFixed(2)} m
+      </div>`:''}
+      <div style="font-size:8px;color:var(--textdim);margin-top:3px">
+        node_id: ${e.node_id.slice(0,18)}…
+      </div>
+    </div>`;
+
+  // ── Tags + crucial words ──────────────────────────────────────────────────
+  const tagsHtml = `
+    <div class="detail-section">
+      <div class="detail-label">TAGS &amp; KEYWORDS</div>
+      <div style="margin-bottom:4px">
+        ${(e.tags||[]).map(t=>`<span class="tag" style="color:${col};background:${col}15;border-color:${col}33">${t}</span>`).join('')
+          || '<span style="color:var(--textdim);font-size:9px">no tags</span>'}
+      </div>
+      <div>
+        ${(e.top_words||[]).map(w=>`<span class="tag" style="color:var(--acc4);background:var(--acc4)15;border-color:var(--acc4)33">${w}</span>`).join('')
+          || '<span style="color:var(--textdim);font-size:9px">no keywords</span>'}
+      </div>
+    </div>`;
+
+  // ── Runtime embedding ──────────────────────────────────────────────────────
+  let embHtml = '';
+  if (e.runtime_embedding) {
+    let emb = e.runtime_embedding;
+    if (typeof emb === 'string') {
+      try { emb = JSON.parse(emb); } catch(_) { emb = null; }
+    }
+    if (Array.isArray(emb) && emb.length) {
+      const dim = emb.length;
+      const norm = Math.sqrt(emb.reduce((s,v)=>s+v*v,0));
+      // Mini sparkline of first 32 values
+      const preview = emb.slice(0,32);
+      const mn = Math.min(...preview), mx = Math.max(...preview), rng = mx-mn||1;
+      const bars = preview.map(v=>{
+        const h = Math.round(((v-mn)/rng)*20);
+        return `<span style="display:inline-block;width:5px;height:${Math.max(1,h)}px;
+                  background:var(--acc4);margin-right:1px;vertical-align:bottom"></span>`;
+      }).join('');
+      embHtml = `
+        <div class="detail-section">
+          <div class="detail-label">RUNTIME EMBEDDING  <span style="color:var(--textdim)">vec(${dim})</span></div>
+          <div style="line-height:24px;margin-bottom:4px">${bars}</div>
+          <div style="font-size:8px;color:var(--textdim)">
+            dim=${dim} &nbsp; L2-norm=${norm.toFixed(4)}
+            &nbsp; min=${mn.toFixed(3)} &nbsp; max=${mx.toFixed(3)}
+          </div>
+        </div>`;
+    }
+  }
+
+  // ── Media ─────────────────────────────────────────────────────────────────
+  let mediaHtml = '';
+  const hasMedia = (e.image_ptrs&&e.image_ptrs.length) || e.audio_ptr || e.video_ptr;
+  if (hasMedia) {
+    const imgs = (e.image_ptrs||[]).map(p=>{
+      // If it's a data URI we render it; otherwise show ref string
+      const isData = p.startsWith('data:');
+      return isData
+        ? `<img src="${p}" style="max-width:100%;border-radius:4px;margin-bottom:4px;border:1px solid var(--border)">`
+        : `<div style="font-size:9px;color:var(--acc);background:var(--panel2);
+                       padding:3px 6px;border-radius:3px;margin-bottom:3px">📷 ${p}</div>`;
+    }).join('');
+    const audHtml = e.audio_ptr
+      ? `<div style="font-size:9px;color:var(--acc2);background:var(--panel2);
+                     padding:3px 6px;border-radius:3px;margin-bottom:3px">🎤 ${e.audio_ptr}</div>` : '';
+    const vidHtml = e.video_ptr
+      ? `<div style="font-size:9px;color:var(--acc3);background:var(--panel2);
+                     padding:3px 6px;border-radius:3px">🎥 ${e.video_ptr}</div>` : '';
+    mediaHtml = `
+      <div class="detail-section">
+        <div class="detail-label">MEDIA</div>
+        ${imgs}${audHtml}${vidHtml}
+      </div>`;
+  }
+
+  // ── Edges ────────────────────────────────────────────────────────────────
+  const edgesHtml = entEdges.length ? entEdges.map(ed => {
     const otherId = ed.node_id_1===e.node_id ? ed.node_id_2 : ed.node_id_1;
     const other   = STATE.entities.find(x=>x.node_id===otherId);
     const ecol    = relColor(ed.rel_type);
     return `<div class="edge-row">
       <span class="edge-rel" style="background:${ecol}22;color:${ecol};border:1px solid ${ecol}44">${ed.rel_type}</span>
-      <span class="edge-target">${other?other.name:otherId.slice(0,8)+'…'}</span>
-      <span class="edge-name">${ed.rel_name||''}</span>
+      <span class="edge-target" style="flex:1">${other?other.name:otherId.slice(0,8)+'…'}</span>
+      <span class="edge-name" style="color:var(--textdim)">${ed.rel_name||''}</span>
     </div>`;
   }).join('') : '<div style="color:var(--textdim);font-size:9px">No edges</div>';
 
-  let infoHtml = infos.length ? infos.map(inf => `
-    <div class="info-card">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:4px">
-        ${(inf.crucial_words||[]).map(w=>`<span class="tag">${w}</span>`).join('')}
-        <span style="color:var(--textdim);font-size:8px;margin-left:auto">w=${(inf.weight||1).toFixed(2)}</span>
+  // ── Info nodes (full knowledge) ───────────────────────────────────────────
+  const infoHtml = infos.length ? infos.map((inf,i) => `
+    <div class="info-card" style="margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:5px">
+        <span style="font-size:7px;color:var(--textdim);background:var(--muted);
+                     padding:1px 5px;border-radius:2px">#${i+1}</span>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;flex:1">
+          ${(inf.crucial_words||[]).map(w=>`<span class="tag">${w}</span>`).join('')}
+        </div>
+        <span style="font-size:8px;color:var(--textdim);flex-shrink:0">w=${(inf.weight||1).toFixed(2)}</span>
       </div>
-      ${inf.full_data?`<div class="info-full">${inf.full_data.slice(0,400)}${inf.full_data.length>400?'…':''}</div>`:''}
-      ${inf.image_ptr?`<div style="color:var(--acc);font-size:8px;margin-top:4px">🖼 ${inf.image_ptr}</div>`:''}
-      ${inf.video_ptr?`<div style="color:var(--acc2);font-size:8px">🎥 ${inf.video_ptr}</div>`:''}
-    </div>`).join('') : '<div style="color:var(--textdim);font-size:9px">No info nodes</div>';
-
-  return `
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
-      <div style="width:40px;height:40px;border-radius:50%;border:2px solid ${col};background:${col}22;
-                  display:flex;align-items:center;justify-content:center;color:${col};font-size:18px;font-weight:bold;flex-shrink:0">
-        ${(e.entity_type||'?')[0].toUpperCase()}</div>
-      <div>
-        <div style="color:${col};font-size:14px;font-weight:bold">${e.name}</div>
-        <div style="color:var(--textdim);font-size:9px">${e.entity_type||'?'} · floor ${e.floor_level||0} · w=${(e.weight||1).toFixed(2)}</div>
+      ${inf.full_data?`
+        <div style="font-size:9px;color:var(--text);line-height:1.7;
+                    background:var(--panel2);border-radius:3px;padding:6px 8px;
+                    white-space:pre-wrap;word-break:break-word;
+                    border-left:2px solid ${col}55">
+          ${inf.full_data}
+        </div>`:''}
+      <div style="display:flex;gap:8px;margin-top:4px;font-size:8px;color:var(--textdim)">
+        ${inf.image_ptr?`<span style="color:var(--acc)">📷 ${inf.image_ptr}</span>`:''}
+        ${inf.video_ptr?`<span style="color:var(--acc2)">🎥 ${inf.video_ptr}</span>`:''}
+        ${inf.audio_ptr?`<span style="color:var(--acc3)">🎤 ${inf.audio_ptr}</span>`:''}
+        <span style="margin-left:auto">${inf.node_id?inf.node_id.slice(0,8)+'…':''}</span>
       </div>
-    </div>
+    </div>`).join('')
+    : '<div style="color:var(--textdim);font-size:9px">No info nodes stored yet</div>';
 
-    ${e.summary?`<div class="detail-section"><div class="detail-label">SUMMARY</div><div class="detail-value">${e.summary}</div></div>`:''}
-
-    <div class="detail-section">
-      <div class="detail-label">POSITION</div>
-      <div class="detail-value" style="font-family:'JetBrains Mono',monospace;color:var(--acc)">
-        x=${(e.x||0).toFixed(3)}m &nbsp; y=${(e.y||0).toFixed(3)}m &nbsp; z=${(e.z||0).toFixed(3)}m
-      </div>
-      ${e.facing_deg!=null?`<div class="detail-value">hdg=${e.facing_deg}° &nbsp; pitch=${e.pitch_deg||0}°</div>`:''}
-      ${e.bbox_dx?`<div class="detail-value" style="color:var(--textdim)">bbox ${(e.bbox_dx*2).toFixed(2)}×${(e.bbox_dy*2).toFixed(2)}×${(e.bbox_dz*2).toFixed(2)}m</div>`:''}
-    </div>
-
-    <div class="detail-section">
-      <div class="detail-label">TAGS</div>
-      <div>${(e.tags||[]).map(t=>`<span class="tag" style="color:${col};background:${col}15;border-color:${col}33">${t}</span>`).join('')||'<span style="color:var(--textdim);font-size:9px">none</span>'}</div>
-    </div>
-
-    <div class="detail-section">
-      <div class="detail-label">CRUCIAL WORDS</div>
-      <div>${(e.top_words||[]).map(t=>`<span class="tag">${t}</span>`).join('')||'<span style="color:var(--textdim);font-size:9px">none</span>'}</div>
-    </div>
-
-    ${e.image_ptrs&&e.image_ptrs.length?`
-    <div class="detail-section">
-      <div class="detail-label">MEDIA</div>
-      ${e.image_ptrs.map(p=>`<div style="color:var(--acc);font-size:9px">🖼 ${p}</div>`).join('')}
-      ${e.video_ptr?`<div style="color:var(--acc2);font-size:9px">🎥 ${e.video_ptr}</div>`:''}
-    </div>`:''}
-
+  return headerHtml + summaryHtml + posHtml + tagsHtml + embHtml + mediaHtml + `
     <div class="detail-section">
       <div class="detail-label">RELATIONSHIPS (${entEdges.length})</div>
       ${edgesHtml}
     </div>
-
     <div class="detail-section">
-      <div class="detail-label">INFO NODES (${infos.length}) <span style="color:var(--textdim);font-size:8px">full_data</span></div>
+      <div class="detail-label">KNOWLEDGE  (${infos.length} info nodes)</div>
       ${infoHtml}
     </div>`;
 }
